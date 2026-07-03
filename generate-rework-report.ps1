@@ -71,7 +71,7 @@ function Get-ComparableFiles {
 
     $files = @(Invoke-Git -Arguments @("ls-tree", "-r", "--name-only", $Commit))
     return @($files | Where-Object {
-        ($_ -match "\.(cs|xaml)$") -and ($_ -notmatch "(?i)test")
+        ($_ -match "\.(cs|xaml)$") -and -not (Test-ExcludedPath -Path $_)
     })
 }
 
@@ -79,8 +79,37 @@ function Get-ProjectFiles {
     param([string]$Commit)
 
     return @(Invoke-Git -Arguments @("ls-tree", "-r", "--name-only", $Commit) | Where-Object {
-        ($_ -match "\.csproj$") -and ($_ -notmatch "(?i)test")
+        ($_ -match "\.csproj$") -and -not (Test-ExcludedPath -Path $_)
     })
+}
+
+function Test-ExcludedPath {
+    param([string]$Path)
+
+    $normalizedPath = $Path.Replace("\", "/").ToLowerInvariant()
+    $fileName = Get-FileName -Path $normalizedPath
+
+    if ($normalizedPath -match "test") {
+        return $true
+    }
+
+    if ($normalizedPath -match "(^|/)(templates?|projecttemplates?|itemtemplates?|generated)(/|$)") {
+        return $true
+    }
+
+    if ($normalizedPath -match "(^|/)(bin|obj)(/|$)") {
+        return $true
+    }
+
+    if ($fileName -match "\.g(\.i)?\.cs$") {
+        return $true
+    }
+
+    if ($fileName -match "\.designer\.cs$") {
+        return $true
+    }
+
+    return $false
 }
 
 function Get-FileName {
@@ -118,6 +147,19 @@ function Get-ProjectName {
     return [System.IO.Path]::GetFileNameWithoutExtension((Get-FileName -Path $bestProject))
 }
 
+function Test-DocumentationLine {
+    param(
+        [string]$Path,
+        [string]$Line
+    )
+
+    if ($Path -notmatch "\.cs$") {
+        return $false
+    }
+
+    return $Line -match "^\s*///"
+}
+
 function Count-LinesAtCommit {
     param(
         [string]$Commit,
@@ -125,7 +167,7 @@ function Count-LinesAtCommit {
     )
 
     $content = @(Invoke-Git -Arguments @("show", "$Commit`:$Path"))
-    return @($content).Count
+    return @($content | Where-Object { -not (Test-DocumentationLine -Path $Path -Line $_) }).Count
 }
 
 function HtmlEncode {
@@ -156,38 +198,11 @@ function Format-WholeNumber {
     return $Value.ToString("N0", [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
-function Convert-Numstat {
-    param([string[]]$Lines)
-
-    if ($Lines.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$Lines[0])) {
-        return [pscustomobject]@{
-            Added = 0
-            Deleted = 0
-            IsBinary = $false
-            HasChanges = $false
-        }
-    }
-
-    $parts = ([string]$Lines[0]) -split "`t"
-    if ($parts.Count -lt 3 -or $parts[0] -eq "-" -or $parts[1] -eq "-") {
-        return [pscustomobject]@{
-            Added = 0
-            Deleted = 0
-            IsBinary = $true
-            HasChanges = $true
-        }
-    }
-
-    return [pscustomobject]@{
-        Added = [int]$parts[0]
-        Deleted = [int]$parts[1]
-        IsBinary = $false
-        HasChanges = $true
-    }
-}
-
 function Format-DiffHtml {
-    param([string[]]$Lines)
+    param(
+        [string[]]$Lines,
+        [string]$Path
+    )
 
     $htmlLines = New-Object System.Collections.Generic.List[string]
     $oldLine = $null
@@ -204,10 +219,10 @@ function Format-DiffHtml {
             $newLine = [int]$Matches[2]
             continue
         }
-        elseif ($line -match "^\+\+\+") {
+        elseif ($line -match "^\+\+\+ ") {
             continue
         }
-        elseif ($line -match "^---") {
+        elseif ($line -match "^--- ") {
             continue
         }
         elseif ($line -match "^\+") {
@@ -216,12 +231,18 @@ function Format-DiffHtml {
                 $newNumber = [string]$newLine
                 $newLine += 1
             }
+            if (Test-DocumentationLine -Path $Path -Line $line.Substring(1)) {
+                continue
+            }
         }
         elseif ($line -match "^-") {
             $class = "del"
             if ($null -ne $oldLine) {
                 $oldNumber = [string]$oldLine
                 $oldLine += 1
+            }
+            if (Test-DocumentationLine -Path $Path -Line $line.Substring(1)) {
+                continue
             }
         }
         elseif ($line -match "^ ") {
@@ -244,6 +265,44 @@ function Format-DiffHtml {
     }
 
     return ($htmlLines -join "")
+}
+
+function Get-DiffStats {
+    param(
+        [string[]]$Lines,
+        [string]$Path
+    )
+
+    $added = 0
+    $deleted = 0
+    $hasChanges = $false
+
+    foreach ($line in $Lines) {
+        if ($line -match "^(diff --git|index |@@ |--- |\+\+\+ )") {
+            continue
+        }
+
+        if ($line -match "^\+") {
+            $hasChanges = $true
+            if (-not (Test-DocumentationLine -Path $Path -Line $line.Substring(1))) {
+                $added += 1
+            }
+            continue
+        }
+
+        if ($line -match "^-") {
+            $hasChanges = $true
+            if (-not (Test-DocumentationLine -Path $Path -Line $line.Substring(1))) {
+                $deleted += 1
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Added = $added
+        Deleted = $deleted
+        HasChanges = $hasChanges
+    }
 }
 
 function Resolve-BaselineSource {
@@ -348,9 +407,9 @@ $baselineDate = (@(Invoke-Git -Arguments @("show", "-s", $dateFormat, "--format=
 $currentDate = (@(Invoke-Git -Arguments @("show", "-s", $dateFormat, "--format=%cd", $currentCommit)))[0]
 
 Write-Step "Finding comparable .cs and .xaml files."
-$baselineFiles = Get-ComparableFiles -Commit $baselineCommit
-$currentFiles = Get-ComparableFiles -Commit $currentCommit
-$currentProjectFiles = Get-ProjectFiles -Commit $currentCommit
+$baselineFiles = @(Get-ComparableFiles -Commit $baselineCommit)
+$currentFiles = @(Get-ComparableFiles -Commit $currentCommit)
+$currentProjectFiles = @(Get-ProjectFiles -Commit $currentCommit)
 Write-Step "Found $($baselineFiles.Count) baseline production files, $($currentFiles.Count) current production files, and $($currentProjectFiles.Count) current production projects."
 
 $currentFileSet = @{}
@@ -373,30 +432,27 @@ foreach ($path in $commonFiles) {
     $currentLineCount = Count-LinesAtCommit -Commit $currentCommit -Path $path
     $allCurrentLines += $currentLineCount
 
-    $numstat = Convert-Numstat -Lines @(Invoke-Git -Arguments @("diff", "--numstat", $baselineCommit, $currentCommit, "--", $path))
-    if (-not $numstat.HasChanges) {
+    $diff = @(Invoke-Git -Arguments @("diff", "--no-ext-diff", "--unified=$ContextLines", "--src-prefix=baseline/", "--dst-prefix=current/", $baselineCommit, $currentCommit, "--", $path))
+    $diffStats = Get-DiffStats -Lines $diff -Path $path
+    if (-not $diffStats.HasChanges) {
         continue
     }
 
-    if ($numstat.IsBinary) {
-        continue
-    }
-
-    $added = $numstat.Added
-    $deleted = $numstat.Deleted
+    $added = $diffStats.Added
+    $deleted = $diffStats.Deleted
     if ($added -lt $MinAdded -or $deleted -lt $MinDeleted) {
         continue
     }
 
     Write-Step "Hotspot found: $path (+$added -$deleted)."
 
-    $whitespaceNumstat = Convert-Numstat -Lines @(Invoke-Git -Arguments @("diff", "--numstat", "-w", $baselineCommit, $currentCommit, "--", $path))
-    $whitespaceAdded = $whitespaceNumstat.Added
-    $whitespaceDeleted = $whitespaceNumstat.Deleted
+    $whitespaceDiff = @(Invoke-Git -Arguments @("diff", "--no-ext-diff", "-w", "--unified=0", $baselineCommit, $currentCommit, "--", $path))
+    $whitespaceStats = Get-DiffStats -Lines $whitespaceDiff -Path $path
+    $whitespaceAdded = $whitespaceStats.Added
+    $whitespaceDeleted = $whitespaceStats.Deleted
     $whitespaceReworkLines = [Math]::Min($whitespaceAdded, $whitespaceDeleted)
     $whitespaceChurnLines = $whitespaceAdded + $whitespaceDeleted
 
-    $diff = @(Invoke-Git -Arguments @("diff", "--no-ext-diff", "--unified=$ContextLines", "--src-prefix=baseline/", "--dst-prefix=current/", $baselineCommit, $currentCommit, "--", $path))
     $reworkLines = [Math]::Min($added, $deleted)
     $churnLines = $added + $deleted
     $denominator = [Math]::Max($currentLineCount, 1)
@@ -417,7 +473,7 @@ foreach ($path in $commonFiles) {
         ReworkPercent = (100.0 * $reworkLines / $denominator)
         ChurnPercent = (100.0 * $churnLines / $denominator)
         WhitespaceIgnoredReworkPercent = (100.0 * $whitespaceReworkLines / $denominator)
-        DiffHtml = (Format-DiffHtml -Lines $diff)
+        DiffHtml = (Format-DiffHtml -Lines $diff -Path $path)
     })
 }
 Write-Step "Finished scanning. $($qualified.Count) files met the hotspot rule."
@@ -1046,8 +1102,8 @@ $html = @"
         <p class="hint">Rework percentage is replacement lines, min(added, deleted), divided by current comparable production lines.</p>
       </article>
       <article class="metric"><p class="label">Hotspot Files</p><p class="value">$(Format-WholeNumber $hotspots.Count)</p></article>
-      <article class="metric"><p class="label">Comparable Files</p><p class="value">$(Format-WholeNumber $commonFiles.Count)</p><p class="hint">Files existing in both revisions, excluding paths containing test.</p></article>
-      <article class="metric"><p class="label">Comparable Lines</p><p class="value">$(Format-WholeNumber $allCurrentLines)</p><p class="hint">Current lines in comparable production files.</p></article>
+      <article class="metric"><p class="label">Comparable Files</p><p class="value">$(Format-WholeNumber $commonFiles.Count)</p><p class="hint">Files existing in both revisions, excluding tests, templates, and generated files.</p></article>
+      <article class="metric"><p class="label">Comparable Lines</p><p class="value">$(Format-WholeNumber $allCurrentLines)</p><p class="hint">Current production lines excluding XML documentation comments.</p></article>
       <article class="metric"><p class="label">Churn</p><p class="value">$(Format-Number $repoChurnPercent)%</p><p class="hint">Added plus deleted hotspot lines divided by comparable lines.</p></article>
       <article class="metric"><p class="label">Added / Deleted</p><p class="value">$(Format-WholeNumber $totalAdded) / $(Format-WholeNumber $totalDeleted)</p><p class="hint">Line changes in hotspot files.</p></article>
       <article class="metric"><p class="label">Whitespace-Ignored Rework</p><p class="value">$(Format-Number $whitespaceIgnoredReworkPercent)%</p><p class="hint">Rework after ignoring whitespace-only changes.</p></article>
